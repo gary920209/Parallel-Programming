@@ -1,0 +1,338 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <queue>
+#include <unordered_set>
+#include <fstream>
+#include <algorithm>
+#include <climits>
+
+using namespace std;
+
+struct Point{
+    int r, c;
+
+    bool operator==(const Point& other) const {
+        return r == other.r && c == other.c;
+    }
+};
+
+namespace std {
+    template <>
+    struct hash<Point> {
+        size_t operator()(const Point& p) const {
+            return hash<int>()(p.r) ^ hash<int>()(p.c << 1);
+        }
+    };
+}
+
+struct State{
+    Point player;
+    vector<Point> boxes;
+    vector<Point> fragiles;
+    string move;
+    int cost;
+
+    bool operator==(const State& other) const {
+        return player == other.player && boxes == other.boxes && fragiles == other.fragiles;
+    }
+};
+
+namespace std {
+    template <>
+    struct hash<State> {
+        size_t operator()(const State& s) const {
+            size_t h = hash<Point>()(s.player);
+            for (const auto& box : s.boxes) {
+                h ^= hash<Point>()(box) << 1;
+            }
+            for (const auto& fragile : s.fragiles) {
+                h ^= hash<Point>()(fragile) << 2;
+            }
+            return h;
+        }
+    };
+}
+
+vector<string> board;
+vector<Point> targets;
+int rows, cols;
+
+struct StateComparator {
+    bool operator()(const State& a, const State& b) const {
+        return (a.cost + heuristic(a)) > (b.cost + heuristic(b));
+    }
+    
+    static int heuristic(const State& state);
+};
+
+
+bool is_wall(int r, int c){
+    if (r < 0 || r >= rows || c < 0 || c >= cols) return true;
+    return board[r][c] == '#';
+}
+bool is_deadlock(const Point& box_pos){
+    // if box in target, got it!
+    if (find(targets.begin(),targets.end(), box_pos) != targets.end())
+        return false;
+    int r = box_pos.r, c = box_pos.c;
+    if((is_wall(r+1,c) && is_wall(r,c+1)) || (is_wall(r-1,c) && is_wall(r,c-1)) || (is_wall(r-1,c) && is_wall(r,c+1)) || (is_wall(r+1,c) && is_wall(r,c-1)))
+        return true;
+    return false;
+}
+bool is_fragile(const Point& pos, const vector<Point>& fragiles) {
+    return find(fragiles.begin(), fragiles.end(), pos) != fragiles.end();
+}
+
+string find_path(const Point& start, const Point& end, const vector<Point>& boxes, const vector<Point>& fragiles) {
+    if (start == end) return "";
+    
+    queue<pair<Point, string>> q;
+    unordered_set<Point> visited_pos;
+    
+    q.push({start, ""});
+    visited_pos.insert(start);
+    
+    int dr[] = {-1, 0, 1, 0};
+    int dc[] = {0, -1, 0, 1};
+    char move_chars[] = {'W', 'A', 'S', 'D'};
+    
+    while (!q.empty()) {
+        auto [current, path] = q.front();
+        q.pop();
+        
+        for (int i = 0; i < 4; ++i) {
+            Point next = {current.r + dr[i], current.c + dc[i]};
+            
+            if (next == end) {
+                return path + move_chars[i];
+            }
+            
+            if (is_wall(next.r, next.c) || visited_pos.count(next) ||
+                find(boxes.begin(), boxes.end(), next) != boxes.end() ||
+                is_fragile(next, fragiles)) {
+                continue;
+            }
+            
+            visited_pos.insert(next);
+            q.push({next, path + move_chars[i]});
+        }
+    }
+    
+    return "";
+}
+unordered_set<Point> get_reachable_positions(const Point& player_pos, const vector<Point>& boxes, const vector<Point>& fragiles) {
+    unordered_set<Point> reachable;
+    queue<Point> q;
+    unordered_set<Point> visited_pos;
+    
+    q.push(player_pos);
+    visited_pos.insert(player_pos);
+    reachable.insert(player_pos);
+    
+    while (!q.empty()) {
+        Point current = q.front();
+        q.pop();
+        
+        int dr[] = {-1, 0, 1, 0};
+        int dc[] = {0, -1, 0, 1};
+        
+        for (int i = 0; i < 4; ++i) {
+            Point next = {current.r + dr[i], current.c + dc[i]};
+            
+            // Skip if wall or already visited
+            if (is_wall(next.r, next.c) || visited_pos.count(next)) {
+                continue;
+            }
+                        
+            // If next position has a box, we can't move there, but we can push from current position
+            auto box_it = find(boxes.begin(), boxes.end(), next);
+            if (box_it != boxes.end()) {
+                // We can potentially push from current position, so current is reachable for pushing
+                reachable.insert(current);
+                continue;
+            }
+            
+            // Normal movement - add to reachable and continue exploring
+            visited_pos.insert(next);
+            reachable.insert(next);
+            q.push(next);
+        }
+    }
+    
+    return reachable;
+}
+
+string AStar(const State& initial_state){
+    priority_queue<State, vector<State>, StateComparator> pq;
+    unordered_set<State> closed_set;
+    
+    State start_state = initial_state;
+    start_state.cost = 0;
+    pq.push(start_state);
+
+    while(!pq.empty()){
+        State current_state = pq.top();
+        pq.pop();
+        
+        if (closed_set.count(current_state)) {
+            continue;
+        }
+        closed_set.insert(current_state);
+        
+        // Check if solution found
+        bool all_on_target = true;
+        for(const auto& box: current_state.boxes){
+            if (find(targets.begin(), targets.end(), box) == targets.end()){
+                all_on_target = false;
+                break;
+            }
+        }
+        if (all_on_target) {
+            return current_state.move;
+        }
+
+        // Get all reachable positions for pushing
+        unordered_set<Point> push_positions = get_reachable_positions(current_state.player, current_state.boxes, current_state.fragiles);
+        
+        int dr[] = {-1, 0, 1, 0};
+        int dc[] = {0, -1, 0, 1};
+        char move_chars[] = {'W', 'A', 'S', 'D'};
+        
+        // Only consider box-pushing moves from reachable positions
+        for (const Point& push_pos : push_positions) {
+            for (int j = 0; j < 4; ++j) {
+                Point box_pos = {push_pos.r + dr[j], push_pos.c + dc[j]};
+                Point next_box_pos = {box_pos.r + dr[j], box_pos.c + dc[j]};
+                
+                // Check if there's a box at box_pos that can be pushed
+                auto box_it = find(current_state.boxes.begin(), current_state.boxes.end(), box_pos);
+                if (box_it == current_state.boxes.end()) continue;
+                
+                // Check if box can be pushed
+                if (is_wall(next_box_pos.r, next_box_pos.c) ||
+                    find(current_state.boxes.begin(), current_state.boxes.end(), next_box_pos) != current_state.boxes.end() ||
+                    is_fragile(next_box_pos, current_state.fragiles) ||
+                    is_deadlock(next_box_pos)) {
+                    continue;
+                }
+                
+                string path_to_push = find_path(current_state.player, push_pos, current_state.boxes, current_state.fragiles);
+                
+                State next_state = current_state;
+                next_state.player = box_pos;
+                next_state.boxes[distance(current_state.boxes.begin(), box_it)] = next_box_pos;
+                sort(next_state.boxes.begin(), next_state.boxes.end(), [](const Point& a, const Point& b) {
+                    return a.r < b.r || (a.r == b.r && a.c < b.c);
+                });
+                next_state.move += path_to_push + move_chars[j];
+                next_state.cost = current_state.cost + path_to_push.length() + 1;
+                
+                if (closed_set.find(next_state) == closed_set.end()) {
+                    pq.push(next_state);
+                }
+            }
+        }
+    }
+
+    return ""; 
+}
+
+int StateComparator::heuristic(const State& state) {
+    int total_distance = 0;
+    vector<bool> target_used(targets.size(), false);
+    
+    for (const auto& box : state.boxes) {
+        int min_dist = INT_MAX;
+        int best_target = -1;
+        
+        for (int i = 0; i < targets.size(); ++i) {
+            if (target_used[i]) continue;
+            int dist = abs(box.r - targets[i].r) + abs(box.c - targets[i].c);
+            if (dist < min_dist) {
+                min_dist = dist;
+                best_target = i;
+            }
+        }
+        
+        if (best_target != -1) {
+            target_used[best_target] = true;
+            total_distance += min_dist;
+        }
+    }
+    
+    return total_distance;
+}
+
+int main(int argc, char* argv[]) {
+    // 1) check args and file open
+    if (argc < 2) {
+        cerr << "Usage: " << argv[0] << " <input_file>\n";
+        return 1;
+    }
+    ifstream infile(argv[1]);
+    if (!infile.is_open()) {
+        cerr << "Error: cannot open file " << argv[1] << "\n";
+        return 1;
+    }
+
+    string line;
+    State initial_state;
+    initial_state.move = "";
+
+    int r = 0;
+    size_t max_len = 0;
+    vector<string> raw_lines;
+    while (getline(infile, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        raw_lines.push_back(line);
+        if (line.size() > max_len) max_len = line.size();
+        r++;
+    }
+    infile.close();
+
+    if (raw_lines.empty()) {
+        cerr << "Error: empty board\n";
+        return 1;
+    }
+
+    // pad lines to same length (fill with walls)
+    cols = (int)max_len;
+    for (auto &ln : raw_lines) {
+        if (ln.size() < max_len) ln += string(max_len - ln.size(), '#');
+        board.push_back(ln);
+    }
+    rows = (int)board.size();
+
+    // parse board
+    for (int i = 0; i < rows; ++i) {
+        for (int c = 0; c < cols; ++c) {
+            char ch = board[i][c];
+            if (ch == 'o' || ch == 'O' || ch == '!') {
+                initial_state.player = {i, c};
+            }
+            if (ch == 'x' || ch == 'X') {
+                initial_state.boxes.push_back({i, c});
+            }
+            if (ch == '.' || ch == 'X' || ch == 'O') {
+                targets.push_back({i, c});
+            }
+            if (ch == '@' || ch == '!') {
+                initial_state.fragiles.push_back({i, c});
+            }
+        }
+    }
+
+    sort(initial_state.boxes.begin(), initial_state.boxes.end(), [](const Point& a, const Point& b) {
+        return a.r < b.r || (a.r == b.r && a.c < b.c);
+    });
+
+    sort(initial_state.fragiles.begin(), initial_state.fragiles.end(), [](const Point& a, const Point& b) {
+        return a.r < b.r || (a.r == b.r && a.c < b.c);
+    });
+
+    string solution = AStar(initial_state);
+    cout << solution << endl;
+    return 0;
+}
+
