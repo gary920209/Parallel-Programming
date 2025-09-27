@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <climits>
 #include <omp.h> // Include the OpenMP header
+#include <boost/functional/hash.hpp> // Add Boost hash header
 
 using namespace std;
 
@@ -22,7 +23,10 @@ namespace std {
     template <>
     struct hash<Point> {
         size_t operator()(const Point& p) const {
-            return hash<int>()(p.r) ^ hash<int>()(p.c << 1);
+            size_t seed = 0;
+            boost::hash_combine(seed, p.r);
+            boost::hash_combine(seed, p.c);
+            return seed;
         }
     };
 }
@@ -43,14 +47,19 @@ namespace std {
     template <>
     struct hash<State> {
         size_t operator()(const State& s) const {
-            size_t h = hash<Point>()(s.player);
+            size_t seed = 0;
+            boost::hash_combine(seed, hash<Point>()(s.player));
+            
+            // Hash the vectors using boost
             for (const auto& box : s.boxes) {
-                h ^= hash<Point>()(box) << 1;
+                boost::hash_combine(seed, hash<Point>()(box));
             }
+            
             for (const auto& fragile : s.fragiles) {
-                h ^= hash<Point>()(fragile) << 2;
+                boost::hash_combine(seed, hash<Point>()(fragile));
             }
-            return h;
+            
+            return seed;
         }
     };
 }
