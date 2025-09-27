@@ -1,3 +1,8 @@
+#include <tbb/concurrent_queue.h>
+#include <tbb/concurrent_unordered_set.h>
+#include <tbb/concurrent_vector.h>
+#include <tbb/parallel_for.h>
+#include <tbb/blocked_range.h>
 #include <iostream>
 #include <vector>
 #include <string>
@@ -8,6 +13,8 @@
 #include <climits>
 #include <omp.h> // Include the OpenMP header
 #include <boost/functional/hash.hpp> // Add Boost hash header
+#include <mutex>
+#include <atomic>
 
 using namespace std;
 
@@ -81,6 +88,58 @@ bool is_wall(int r, int c){
     if (r < 0 || r >= rows || c < 0 || c >= cols) return true;
     return board[r][c] == '#';
 }
+
+void mark_unreachable_as_fragile(State& initial_state) {
+    // BFS from all target positions to find reachable cells
+    unordered_set<Point> reachable;
+    queue<Point> q;
+    
+    // Start BFS from all targets
+    for (const Point& target : targets) {
+        if (!is_wall(target.r, target.c)) {
+            q.push(target);
+            reachable.insert(target);
+        }
+    }
+    
+    int dr[] = {-1, 0, 1, 0};
+    int dc[] = {0, -1, 0, 1};
+    
+    while (!q.empty()) {
+        Point current = q.front();
+        q.pop();
+        
+        for (int i = 0; i < 4; ++i) {
+            Point next = {current.r + dr[i], current.c + dc[i]};
+            
+            if (is_wall(next.r, next.c) || reachable.count(next)) {
+                continue;
+            }
+            
+            reachable.insert(next);
+            q.push(next);
+        }
+    }
+    
+    // Mark all unreachable non-wall cells as fragile
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            Point pos = {r, c};
+            if (!is_wall(r, c) && reachable.find(pos) == reachable.end()) {
+                // Check if this position is not already fragile
+                if (find(initial_state.fragiles.begin(), initial_state.fragiles.end(), pos) == initial_state.fragiles.end()) {
+                    initial_state.fragiles.push_back(pos);
+                }
+            }
+        }
+    }
+    
+    // Sort fragiles again after adding new ones
+    sort(initial_state.fragiles.begin(), initial_state.fragiles.end(), [](const Point& a, const Point& b) {
+        return a.r < b.r || (a.r == b.r && a.c < b.c);
+    });
+}
+
 bool is_deadlock(const Point& box_pos){
     // if box in target, got it!
     if (find(targets.begin(),targets.end(), box_pos) != targets.end())
@@ -88,6 +147,10 @@ bool is_deadlock(const Point& box_pos){
     int r = box_pos.r, c = box_pos.c;
     if((is_wall(r+1,c) && is_wall(r,c+1)) || (is_wall(r-1,c) && is_wall(r,c-1)) || (is_wall(r-1,c) && is_wall(r,c+1)) || (is_wall(r+1,c) && is_wall(r,c-1)))
         return true;
+    // in wall but no target in here
+    // Horizontal wall check
+    
+    
     return false;
 }
 bool is_fragile(const Point& pos, const vector<Point>& fragiles) {
@@ -170,8 +233,9 @@ unordered_set<Point> get_reachable_positions(const Point& player_pos, const vect
 }
 
 string AStar(const State& initial_state){
+    // Use regular priority_queue (single-threaded)
     priority_queue<State, vector<State>, StateComparator> pq;
-    unordered_set<State> closed_set;
+    tbb::concurrent_unordered_set<State> closed_set;
     
     State start_state = initial_state;
     start_state.cost = 0;
@@ -194,7 +258,7 @@ string AStar(const State& initial_state){
             }
         }
         if (all_on_target) {
-            return current_state.move;
+            return current_state.move;  // Solution found and returned here
         }
 
         unordered_set<Point> push_positions = get_reachable_positions(current_state.player, current_state.boxes, current_state.fragiles);
@@ -203,41 +267,57 @@ string AStar(const State& initial_state){
         int dc[] = {0, -1, 0, 1};
         char move_chars[] = {'W', 'A', 'S', 'D'};
         
-        // Process positions sequentially to avoid resource allocation issues
-        for (const Point& push_pos : push_positions) {
-            for (int j = 0; j < 4; ++j) {
-                Point box_pos = {push_pos.r + dr[j], push_pos.c + dc[j]};
-                Point next_box_pos = {box_pos.r + dr[j], box_pos.c + dc[j]};
-                
-                auto box_it = find(current_state.boxes.begin(), current_state.boxes.end(), box_pos);
-                if (box_it == current_state.boxes.end()) continue;
-                
-                if (is_wall(next_box_pos.r, next_box_pos.c) ||
-                    find(current_state.boxes.begin(), current_state.boxes.end(), next_box_pos) != current_state.boxes.end() ||
-                    is_fragile(next_box_pos, current_state.fragiles) ||
-                    is_deadlock(next_box_pos)) {
-                    continue;
+        // Convert push_positions to vector for parallel processing
+        std::vector<Point> push_pos_vec(push_positions.begin(), push_positions.end());
+        
+        // Use concurrent_vector to store generated next states
+        tbb::concurrent_vector<State> next_states;
+        
+        // Use TBB parallel_for to generate next states in parallel
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, push_pos_vec.size()),
+            [&](const tbb::blocked_range<size_t>& range) {
+                for (size_t i = range.begin(); i != range.end(); ++i) {
+                    const Point& push_pos = push_pos_vec[i];
+                    
+                    for (int j = 0; j < 4; ++j) {
+                        Point box_pos = {push_pos.r + dr[j], push_pos.c + dc[j]};
+                        Point next_box_pos = {box_pos.r + dr[j], box_pos.c + dc[j]};
+                        
+                        auto box_it = find(current_state.boxes.begin(), current_state.boxes.end(), box_pos);
+                        if (box_it == current_state.boxes.end()) continue;
+                        
+                        if (is_wall(next_box_pos.r, next_box_pos.c) ||
+                            find(current_state.boxes.begin(), current_state.boxes.end(), next_box_pos) != current_state.boxes.end() ||
+                            is_fragile(next_box_pos, current_state.fragiles) ||
+                            is_deadlock(next_box_pos)) {
+                            continue;
+                        }
+                        
+                        string path_to_push = find_path(current_state.player, push_pos, current_state.boxes, current_state.fragiles);
+                        
+                        State next_state = current_state;
+                        next_state.player = box_pos;
+                        next_state.boxes[distance(current_state.boxes.begin(), box_it)] = next_box_pos;
+                        sort(next_state.boxes.begin(), next_state.boxes.end(), [](const Point& a, const Point& b) {
+                            return a.r < b.r || (a.r == b.r && a.c < b.c);
+                        });
+                        next_state.move += path_to_push + move_chars[j];
+                        next_state.cost = current_state.cost + path_to_push.length() + 1;
+                        
+                        if (closed_set.find(next_state) == closed_set.end()) {
+                            next_states.push_back(next_state);
+                        }
+                    }
                 }
-                
-                string path_to_push = find_path(current_state.player, push_pos, current_state.boxes, current_state.fragiles);
-                
-                State next_state = current_state;
-                next_state.player = box_pos;
-                next_state.boxes[distance(current_state.boxes.begin(), box_it)] = next_box_pos;
-                sort(next_state.boxes.begin(), next_state.boxes.end(), [](const Point& a, const Point& b) {
-                    return a.r < b.r || (a.r == b.r && a.c < b.c);
-                });
-                next_state.move += path_to_push + move_chars[j];
-                next_state.cost = current_state.cost + path_to_push.length() + 1;
-                
-                if (closed_set.find(next_state) == closed_set.end()) {
-                    pq.push(next_state);
-                }
-            }
+            });
+        
+        // After parallel region, push all generated states to priority_queue
+        for (const auto& state : next_states) {
+            pq.push(state);
         }
     }
 
-    return ""; 
+    return ""; // No solution found
 }
 
 int StateComparator::heuristic(const State& state) {
@@ -267,6 +347,7 @@ int StateComparator::heuristic(const State& state) {
 }
 
 int main(int argc, char* argv[]) {
+    
     // 1) check args and file open
     if (argc < 2) {
         cerr << "Usage: " << argv[0] << " <input_file>\n";
@@ -332,6 +413,9 @@ int main(int argc, char* argv[]) {
     sort(initial_state.fragiles.begin(), initial_state.fragiles.end(), [](const Point& a, const Point& b) {
         return a.r < b.r || (a.r == b.r && a.c < b.c);
     });
+
+    // Mark unreachable positions as fragile (deadlock detection)
+    mark_unreachable_as_fragile(initial_state);
 
     string solution = AStar(initial_state);
     cout << solution << endl;
