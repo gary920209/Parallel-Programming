@@ -6,6 +6,7 @@
 #include <fstream>
 #include <algorithm>
 #include <climits>
+#include <omp.h> // Include the OpenMP header
 
 using namespace std;
 
@@ -140,20 +141,16 @@ unordered_set<Point> get_reachable_positions(const Point& player_pos, const vect
         for (int i = 0; i < 4; ++i) {
             Point next = {current.r + dr[i], current.c + dc[i]};
             
-            // Skip if wall or already visited
             if (is_wall(next.r, next.c) || visited_pos.count(next)) {
                 continue;
             }
                         
-            // If next position has a box, we can't move there, but we can push from current position
             auto box_it = find(boxes.begin(), boxes.end(), next);
             if (box_it != boxes.end()) {
-                // We can potentially push from current position, so current is reachable for pushing
                 reachable.insert(current);
                 continue;
             }
             
-            // Normal movement - add to reachable and continue exploring
             visited_pos.insert(next);
             reachable.insert(next);
             q.push(next);
@@ -180,7 +177,6 @@ string AStar(const State& initial_state){
         }
         closed_set.insert(current_state);
         
-        // Check if solution found
         bool all_on_target = true;
         for(const auto& box: current_state.boxes){
             if (find(targets.begin(), targets.end(), box) == targets.end()){
@@ -192,24 +188,21 @@ string AStar(const State& initial_state){
             return current_state.move;
         }
 
-        // Get all reachable positions for pushing
         unordered_set<Point> push_positions = get_reachable_positions(current_state.player, current_state.boxes, current_state.fragiles);
         
         int dr[] = {-1, 0, 1, 0};
         int dc[] = {0, -1, 0, 1};
         char move_chars[] = {'W', 'A', 'S', 'D'};
         
-        // Only consider box-pushing moves from reachable positions
+        // Process positions sequentially to avoid resource allocation issues
         for (const Point& push_pos : push_positions) {
             for (int j = 0; j < 4; ++j) {
                 Point box_pos = {push_pos.r + dr[j], push_pos.c + dc[j]};
                 Point next_box_pos = {box_pos.r + dr[j], box_pos.c + dc[j]};
                 
-                // Check if there's a box at box_pos that can be pushed
                 auto box_it = find(current_state.boxes.begin(), current_state.boxes.end(), box_pos);
                 if (box_it == current_state.boxes.end()) continue;
                 
-                // Check if box can be pushed
                 if (is_wall(next_box_pos.r, next_box_pos.c) ||
                     find(current_state.boxes.begin(), current_state.boxes.end(), next_box_pos) != current_state.boxes.end() ||
                     is_fragile(next_box_pos, current_state.fragiles) ||
@@ -246,7 +239,7 @@ int StateComparator::heuristic(const State& state) {
         int min_dist = INT_MAX;
         int best_target = -1;
         
-        for (int i = 0; i < targets.size(); ++i) {
+        for (size_t i = 0; i < targets.size(); ++i) {
             if (target_used[i]) continue;
             int dist = abs(box.r - targets[i].r) + abs(box.c - targets[i].c);
             if (dist < min_dist) {
@@ -335,4 +328,3 @@ int main(int argc, char* argv[]) {
     cout << solution << endl;
     return 0;
 }
-
