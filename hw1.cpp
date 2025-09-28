@@ -11,7 +11,7 @@
 #include <fstream>
 #include <algorithm>
 #include <climits>
-#include <omp.h> // Include the OpenMP header
+#include <omp.h> 
 #include <boost/functional/hash.hpp>
 #include <mutex>
 #include <atomic>
@@ -20,46 +20,30 @@
 using namespace std;
 
 const int MAX_SIZE = 256; // 16*16 max grid size
-using GridBitset = bitset<MAX_SIZE>;
+using GridBitset = bitset<MAX_SIZE+9>;
 
-struct Point{
-    int r, c;
-
-    bool operator==(const Point& other) const {
-        return r == other.r && c == other.c;
-    }
-};
-
-// Helper functions for bitset operations
-inline int point_to_index(const Point& p, int cols) {
-    return p.r * cols + p.c;
+// Helper functions for index operations
+inline int get_row(int index, int cols) {
+    return index / cols;
 }
 
-inline Point index_to_point(int index, int cols) {
-    return {index / cols, index % cols};
+inline int get_col(int index, int cols) {
+    return index % cols;
 }
 
-namespace std {
-    template <>
-    struct hash<Point> {
-        size_t operator()(const Point& p) const {
-            size_t seed = 0;
-            boost::hash_combine(seed, p.r);
-            boost::hash_combine(seed, p.c);
-            return seed;
-        }
-    };
+inline int to_index(int r, int c, int cols) {
+    return r * cols + c;
 }
 
 struct State{
-    Point player;
+    int player_idx;  // Player position as index
     GridBitset boxes;
     GridBitset fragiles;
     string move;
     int cost;
 
     bool operator==(const State& other) const {
-        return player == other.player && boxes == other.boxes && fragiles == other.fragiles;
+        return player_idx == other.player_idx && boxes == other.boxes && fragiles == other.fragiles;
     }
 };
 
@@ -68,7 +52,7 @@ namespace std {
     struct hash<State> {
         size_t operator()(const State& s) const {
             size_t seed = 0;
-            boost::hash_combine(seed, hash<Point>()(s.player));
+            boost::hash_combine(seed, s.player_idx);
 
             // Hash bitsets efficiently
             auto boxes_hash = std::hash<GridBitset>{}(s.boxes);
@@ -81,9 +65,8 @@ namespace std {
     };
 }
 
-vector<string> board;
-vector<Point> targets;
-GridBitset target_bitset;
+GridBitset wall_bitset;  // For walls
+GridBitset target_bitset; // For targets
 int rows, cols;
 
 // Priority queue item storing index and priority
@@ -103,18 +86,18 @@ struct StateComparator {
 
 bool is_wall(int r, int c){
     if (r < 0 || r >= rows || c < 0 || c >= cols) return true;
-    return board[r][c] == '#';
+    return wall_bitset[r * cols + c];
 }
 bool is_wall_row(int r) {
     for (int c = 0; c < cols; c++) {
-        if (board[r][c] != '#') return false;
+        if (!wall_bitset[r * cols + c]) return false;
     }
     return true;
 }
 
 bool is_wall_col(int c) {
     for (int r = 0; r < rows; r++) {
-        if (board[r][c] != '#') return false;
+        if (!wall_bitset[r * cols + c]) return false;
     }
     return true;
 }
@@ -123,8 +106,8 @@ bool row_col_deadlock(const GridBitset& boxes) {
     for (int idx = 0; idx < rows * cols; ++idx) {
         if (!boxes[idx]) continue;
 
-        Point box = index_to_point(idx, cols);
-        int r = box.r, c = box.c;
+        int r = get_row(idx, cols);
+        int c = get_col(idx, cols);
         bool has_target = false;
 
         if (is_wall_row(r+1)) {
@@ -175,13 +158,14 @@ bool row_col_deadlock(const GridBitset& boxes) {
 }
 
 void mark_unreachable_as_fragile(State& initial_state) {
-    unordered_set<Point> reachable;
-    queue<Point> q;
+    GridBitset reachable;
+    queue<int> q;
 
-    for (const Point& target : targets) {
-        if (!is_wall(target.r, target.c)) {
-            q.push(target);
-            reachable.insert(target);
+    // Start BFS from all targets
+    for (int idx = 0; idx < rows * cols; ++idx) {
+        if (target_bitset[idx] && !wall_bitset[idx]) {
+            q.push(idx);
+            reachable[idx] = 1;
         }
     }
 
@@ -189,35 +173,38 @@ void mark_unreachable_as_fragile(State& initial_state) {
     int dc[] = {0, -1, 0, 1};
 
     while (!q.empty()) {
-        Point current = q.front();
+        int current_idx = q.front();
         q.pop();
 
-        for (int i = 0; i < 4; ++i) {
-            Point next = {current.r + dr[i], current.c + dc[i]};
+        int r = get_row(current_idx, cols);
+        int c = get_col(current_idx, cols);
 
-            if (is_wall(next.r, next.c) || reachable.count(next)) {
+        for (int i = 0; i < 4; ++i) {
+            int nr = r + dr[i];
+            int nc = c + dc[i];
+            int next_idx = to_index(nr, nc, cols);
+
+            if (is_wall(nr, nc) || reachable[next_idx]) {
                 continue;
             }
 
-            reachable.insert(next);
-            q.push(next);
+            reachable[next_idx] = 1;
+            q.push(next_idx);
         }
     }
 
-    for (int r = 0; r < rows; ++r) {
-        for (int c = 0; c < cols; ++c) {
-            Point pos = {r, c};
-            if (!is_wall(r, c) && reachable.find(pos) == reachable.end()) {
-                initial_state.fragiles[point_to_index(pos, cols)] = 1;
-            }
+    for (int idx = 0; idx < rows * cols; ++idx) {
+        if (!wall_bitset[idx] && !reachable[idx]) {
+            initial_state.fragiles[idx] = 1;
         }
     }
 }
 
-bool is_deadlock(const Point& box_pos){
-    if (target_bitset[point_to_index(box_pos, cols)]) return false;
+bool is_deadlock(int box_idx){
+    if (target_bitset[box_idx]) return false;
 
-    int r = box_pos.r, c = box_pos.c;
+    int r = get_row(box_idx, cols);
+    int c = get_col(box_idx, cols);
     if((is_wall(r+1,c) && is_wall(r,c+1)) || (is_wall(r-1,c) && is_wall(r,c-1)) ||
        (is_wall(r-1,c) && is_wall(r,c+1)) || (is_wall(r+1,c) && is_wall(r,c-1)))
         return true;
@@ -225,79 +212,87 @@ bool is_deadlock(const Point& box_pos){
     return false;
 }
 
-bool is_fragile(const Point& pos, const GridBitset& fragiles) {
-    return fragiles[point_to_index(pos, cols)];
+bool is_fragile(int idx, const GridBitset& fragiles) {
+    return fragiles[idx];
 }
 
-string find_path(const Point& start, const Point& end, const GridBitset& boxes, const GridBitset& fragiles) {
-    if (start == end) return "";
+string find_path(int start_idx, int end_idx, const GridBitset& boxes, const GridBitset& fragiles) {
+    if (start_idx == end_idx) return "";
 
-    queue<pair<Point, string>> q;
-    unordered_set<Point> visited_pos;
+    queue<pair<int, string>> q;
+    GridBitset visited;
 
-    q.push({start, ""});
-    visited_pos.insert(start);
+    q.push({start_idx, ""});
+    visited[start_idx] = 1;
 
     int dr[] = {-1, 0, 1, 0};
     int dc[] = {0, -1, 0, 1};
     char move_chars[] = {'W', 'A', 'S', 'D'};
 
     while (!q.empty()) {
-        auto [current, path] = q.front();
+        auto [current_idx, path] = q.front();
         q.pop();
 
-        for (int i = 0; i < 4; ++i) {
-            Point next = {current.r + dr[i], current.c + dc[i]};
+        int r = get_row(current_idx, cols);
+        int c = get_col(current_idx, cols);
 
-            if (next == end) {
+        for (int i = 0; i < 4; ++i) {
+            int nr = r + dr[i];
+            int nc = c + dc[i];
+            int next_idx = to_index(nr, nc, cols);
+
+            if (next_idx == end_idx) {
                 return path + move_chars[i];
             }
 
-            int next_idx = point_to_index(next, cols);
-            if (is_wall(next.r, next.c) || visited_pos.count(next) ||
+            if (is_wall(nr, nc) || visited[next_idx] ||
                 boxes[next_idx] || fragiles[next_idx]) {
                 continue;
             }
 
-            visited_pos.insert(next);
-            q.push({next, path + move_chars[i]});
+            visited[next_idx] = 1;
+            q.push({next_idx, path + move_chars[i]});
         }
     }
 
     return "";
 }
-unordered_set<Point> get_reachable_positions(const Point& player_pos, const GridBitset& boxes, const GridBitset& fragiles) {
-    unordered_set<Point> reachable;
-    queue<Point> q;
-    unordered_set<Point> visited_pos;
+GridBitset get_reachable_positions(int player_idx, const GridBitset& boxes, const GridBitset& fragiles) {
+    GridBitset reachable;
+    queue<int> q;
+    GridBitset visited;
 
-    q.push(player_pos);
-    visited_pos.insert(player_pos);
-    reachable.insert(player_pos);
+    q.push(player_idx);
+    visited[player_idx] = 1;
+    reachable[player_idx] = 1;
 
     while (!q.empty()) {
-        Point current = q.front();
+        int current_idx = q.front();
         q.pop();
+
+        int r = get_row(current_idx, cols);
+        int c = get_col(current_idx, cols);
 
         int dr[] = {-1, 0, 1, 0};
         int dc[] = {0, -1, 0, 1};
 
         for (int i = 0; i < 4; ++i) {
-            Point next = {current.r + dr[i], current.c + dc[i]};
+            int nr = r + dr[i];
+            int nc = c + dc[i];
+            int next_idx = to_index(nr, nc, cols);
 
-            if (is_wall(next.r, next.c) || visited_pos.count(next)) {
+            if (is_wall(nr, nc) || visited[next_idx]) {
                 continue;
             }
 
-            int next_idx = point_to_index(next, cols);
             if (boxes[next_idx]) {
-                reachable.insert(current);
+                reachable[current_idx] = 1;
                 continue;
             }
 
-            visited_pos.insert(next);
-            reachable.insert(next);
-            q.push(next);
+            visited[next_idx] = 1;
+            reachable[next_idx] = 1;
+            q.push(next_idx);
         }
     }
 
@@ -331,7 +326,7 @@ string AStar(const State& initial_state){
             return current_state.move;  // Solution found and returned here
         }
 
-        unordered_set<Point> push_positions = get_reachable_positions(current_state.player, current_state.boxes, current_state.fragiles);
+        GridBitset push_positions = get_reachable_positions(current_state.player_idx, current_state.boxes, current_state.fragiles);
         
         int dr[] = {-1, 0, 1, 0};
         int dc[] = {0, -1, 0, 1};
@@ -339,19 +334,22 @@ string AStar(const State& initial_state){
         
         // Create work items (position + direction pairs) for better load balancing
         struct WorkItem {
-            Point push_pos;
+            int push_idx;
             int direction;
         };
-        
+
         std::vector<WorkItem> work_items;
-        for (const Point& push_pos : push_positions) {
+        for (int push_idx = 0; push_idx < rows * cols; ++push_idx) {
+            if (!push_positions[push_idx]) continue;
+
+            int r = get_row(push_idx, cols);
+            int c = get_col(push_idx, cols);
+
             for (int j = 0; j < 4; ++j) {
-                Point box_pos = {push_pos.r + dr[j], push_pos.c + dc[j]};
-                
+                int box_idx = to_index(r + dr[j], c + dc[j], cols);
                 // Only add work item if there's actually a box at this position
-                int box_idx = point_to_index(box_pos, cols);
                 if (current_state.boxes[box_idx]) {
-                    work_items.push_back({push_pos, j});
+                    work_items.push_back({push_idx, j});
                 }
             }
         }
@@ -367,21 +365,22 @@ string AStar(const State& initial_state){
             [&](const tbb::blocked_range<size_t>& range) {
                 for (size_t i = range.begin(); i != range.end(); ++i) {
                     const WorkItem& work = work_items[i];
-                    const Point& push_pos = work.push_pos;
+                    int push_idx = work.push_idx;
                     int j = work.direction;
-                    
-                    Point box_pos = {push_pos.r + dr[j], push_pos.c + dc[j]};
-                    Point next_box_pos = {box_pos.r + dr[j], box_pos.c + dc[j]};
 
-                    int box_idx = point_to_index(box_pos, cols);
-                    int next_box_idx = point_to_index(next_box_pos, cols);
+                    int push_r = get_row(push_idx, cols);
+                    int push_c = get_col(push_idx, cols);
+                    int box_idx = to_index(push_r + dr[j], push_c + dc[j], cols);
+                    int next_box_idx = to_index(push_r + 2*dr[j], push_c + 2*dc[j], cols);
 
                     if (!current_state.boxes[box_idx]) continue;
 
-                    if (is_wall(next_box_pos.r, next_box_pos.c) ||
+                    int next_r = get_row(next_box_idx, cols);
+                    int next_c = get_col(next_box_idx, cols);
+                    if (is_wall(next_r, next_c) ||
                         current_state.boxes[next_box_idx] ||
                         current_state.fragiles[next_box_idx] ||
-                        is_deadlock(next_box_pos)) {
+                        is_deadlock(next_box_idx)) {
                         continue;
                     }
 
@@ -394,10 +393,10 @@ string AStar(const State& initial_state){
                         continue;
                     }
 
-                    string path_to_push = find_path(current_state.player, push_pos, current_state.boxes, current_state.fragiles);
+                    string path_to_push = find_path(current_state.player_idx, push_idx, current_state.boxes, current_state.fragiles);
 
                     State next_state = current_state;
-                    next_state.player = box_pos;
+                    next_state.player_idx = box_idx;
                     next_state.boxes[box_idx] = 0;
                     next_state.boxes[next_box_idx] = 1;
                     next_state.move += path_to_push + move_chars[j];
@@ -423,27 +422,32 @@ string AStar(const State& initial_state){
 
 int StateComparator::heuristic(const State& state) {
     int total_distance = 0;
-    vector<bool> target_used(targets.size(), false);
+    GridBitset target_used = target_bitset; // Copy target bitset
 
     // Iterate through set bits in boxes bitset
-    for (int idx = 0; idx < rows * cols; ++idx) {
-        if (!state.boxes[idx]) continue;
+    for (int box_idx = 0; box_idx < rows * cols; ++box_idx) {
+        if (!state.boxes[box_idx]) continue;
 
-        Point box = index_to_point(idx, cols);
+        int box_r = get_row(box_idx, cols);
+        int box_c = get_col(box_idx, cols);
         int min_dist = INT_MAX;
-        int best_target = -1;
+        int best_target_idx = -1;
 
-        for (size_t i = 0; i < targets.size(); ++i) {
-            if (target_used[i]) continue;
-            int dist = abs(box.r - targets[i].r) + abs(box.c - targets[i].c);
+        // Find closest unused target
+        for (int target_idx = 0; target_idx < rows * cols; ++target_idx) {
+            if (!target_used[target_idx]) continue;
+
+            int target_r = get_row(target_idx, cols);
+            int target_c = get_col(target_idx, cols);
+            int dist = abs(box_r - target_r) + abs(box_c - target_c);
             if (dist < min_dist) {
                 min_dist = dist;
-                best_target = i;
+                best_target_idx = target_idx;
             }
         }
 
-        if (best_target != -1) {
-            target_used[best_target] = true;
+        if (best_target_idx != -1) {
+            target_used[best_target_idx] = 0; // Mark target as used
             total_distance += min_dist;
         }
     }
@@ -488,29 +492,29 @@ int main(int argc, char* argv[]) {
 
     // pad lines to same length (fill with walls)
     cols = (int)max_len;
-    for (auto &ln : raw_lines) {
-        if (ln.size() < max_len) ln += string(max_len - ln.size(), '#');
-        board.push_back(ln);
-    }
-    rows = (int)board.size();
+    rows = (int)raw_lines.size();
 
-    // Initialize target bitset
+    // Initialize bitsets
+    wall_bitset.reset();
     target_bitset.reset();
 
-    // Parse board
+    // Parse board directly into bitsets
     for (int i = 0; i < rows; ++i) {
+        const string& line = raw_lines[i];
         for (int c = 0; c < cols; ++c) {
-            char ch = board[i][c];
-            int idx = point_to_index({i, c}, cols);
+            char ch = (c < line.size()) ? line[c] : '#';
+            int idx = i * cols + c;
 
+            if (ch == '#') {
+                wall_bitset[idx] = 1;
+            }
             if (ch == 'o' || ch == 'O' || ch == '!') {
-                initial_state.player = {i, c};
+                initial_state.player_idx = idx;
             }
             if (ch == 'x' || ch == 'X') {
                 initial_state.boxes[idx] = 1;
             }
             if (ch == '.' || ch == 'X' || ch == 'O') {
-                targets.push_back({i, c});
                 target_bitset[idx] = 1;
             }
             if (ch == '@' || ch == '!') {
