@@ -88,6 +88,77 @@ bool is_wall(int r, int c){
     if (r < 0 || r >= rows || c < 0 || c >= cols) return true;
     return board[r][c] == '#';
 }
+bool is_wall_row(int r) {
+    for (int c = 0; c < cols; c++) {
+        if (board[r][c] != '#') return false;
+    }
+    return true;
+}
+
+bool is_wall_col(int c) {
+    for (int r = 0; r < rows; r++) {
+        if (board[r][c] != '#') return false;
+    }
+    return true;
+}
+
+bool row_col_deadlock(const vector<Point>& boxes) {
+    for (const auto& box : boxes) {
+        int r = box.r, c = box.c;
+        bool has_target = false;
+
+        if (is_wall_row(r+1)) {
+            for (int cc = 0; cc < cols; cc++) {
+                if (find(targets.begin(), targets.end(), Point{r,cc}) != targets.end()) {
+                    has_target = true;
+                    break;
+                }
+                // if box on target, got it!
+            }
+            if (find(targets.begin(), targets.end(), box) != targets.end())
+                has_target = true;
+
+            if (!has_target) return true;
+        }
+        if (is_wall_row(r-1)) {
+            for (int cc = 0; cc < cols; cc++) {
+                if (find(targets.begin(), targets.end(), Point{r,cc}) != targets.end()) {
+                    has_target = true;
+                    break;
+                }
+            }
+            if (find(targets.begin(), targets.end(), box) != targets.end())
+                has_target = true;
+
+            if (!has_target) return true;
+        }
+
+        if (is_wall_col(c+1)) {
+            for (int rr = 0; rr < rows; rr++) {
+                if (find(targets.begin(), targets.end(), Point{rr,c}) != targets.end()) {
+                    has_target = true;
+                    break;
+                }
+            }
+            if (find(targets.begin(), targets.end(), box) != targets.end())
+                has_target = true;
+
+            if (!has_target) return true;
+        }
+        if (is_wall_col(c-1)) {
+            for (int rr = 0; rr < rows; rr++) {
+                if (find(targets.begin(), targets.end(), Point{rr,c}) != targets.end()) {
+                    has_target = true;
+                    break;
+                }
+            }
+            if (find(targets.begin(), targets.end(), box) != targets.end())
+                has_target = true;
+            if (!has_target) return true;
+        }
+    }
+    return false;
+}
 
 void mark_unreachable_as_fragile(State& initial_state) {
     // BFS from all target positions to find reachable cells
@@ -147,12 +218,11 @@ bool is_deadlock(const Point& box_pos){
     int r = box_pos.r, c = box_pos.c;
     if((is_wall(r+1,c) && is_wall(r,c+1)) || (is_wall(r-1,c) && is_wall(r,c-1)) || (is_wall(r-1,c) && is_wall(r,c+1)) || (is_wall(r+1,c) && is_wall(r,c-1)))
         return true;
-    // in wall but no target in here
-    // Horizontal wall check
-    
+        
     
     return false;
 }
+
 bool is_fragile(const Point& pos, const vector<Point>& fragiles) {
     return find(fragiles.begin(), fragiles.end(), pos) != fragiles.end();
 }
@@ -267,46 +337,73 @@ string AStar(const State& initial_state){
         int dc[] = {0, -1, 0, 1};
         char move_chars[] = {'W', 'A', 'S', 'D'};
         
-        // Convert push_positions to vector for parallel processing
-        std::vector<Point> push_pos_vec(push_positions.begin(), push_positions.end());
+        // Create work items (position + direction pairs) for better load balancing
+        struct WorkItem {
+            Point push_pos;
+            int direction;
+        };
+        
+        std::vector<WorkItem> work_items;
+        for (const Point& push_pos : push_positions) {
+            for (int j = 0; j < 4; ++j) {
+                Point box_pos = {push_pos.r + dr[j], push_pos.c + dc[j]};
+                
+                // Only add work item if there's actually a box at this position
+                if (find(current_state.boxes.begin(), current_state.boxes.end(), box_pos) != current_state.boxes.end()) {
+                    work_items.push_back({push_pos, j});
+                }
+            }
+        }
         
         // Use concurrent_vector to store generated next states
         tbb::concurrent_vector<State> next_states;
         
-        // Use TBB parallel_for to generate next states in parallel
-        tbb::parallel_for(tbb::blocked_range<size_t>(0, push_pos_vec.size()),
+        // Use smaller grain size for better work distribution across threads
+        // Calculate grain size to aim for roughly 6x more chunks than threads
+        size_t grain_size = max(size_t(1), work_items.size() / 24); // 24 = 6 threads * 4 chunks per thread
+        
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, work_items.size(), grain_size),
             [&](const tbb::blocked_range<size_t>& range) {
                 for (size_t i = range.begin(); i != range.end(); ++i) {
-                    const Point& push_pos = push_pos_vec[i];
+                    const WorkItem& work = work_items[i];
+                    const Point& push_pos = work.push_pos;
+                    int j = work.direction;
                     
-                    for (int j = 0; j < 4; ++j) {
-                        Point box_pos = {push_pos.r + dr[j], push_pos.c + dc[j]};
-                        Point next_box_pos = {box_pos.r + dr[j], box_pos.c + dc[j]};
-                        
-                        auto box_it = find(current_state.boxes.begin(), current_state.boxes.end(), box_pos);
-                        if (box_it == current_state.boxes.end()) continue;
-                        
-                        if (is_wall(next_box_pos.r, next_box_pos.c) ||
-                            find(current_state.boxes.begin(), current_state.boxes.end(), next_box_pos) != current_state.boxes.end() ||
-                            is_fragile(next_box_pos, current_state.fragiles) ||
-                            is_deadlock(next_box_pos)) {
-                            continue;
-                        }
-                        
-                        string path_to_push = find_path(current_state.player, push_pos, current_state.boxes, current_state.fragiles);
-                        
-                        State next_state = current_state;
-                        next_state.player = box_pos;
-                        next_state.boxes[distance(current_state.boxes.begin(), box_it)] = next_box_pos;
-                        sort(next_state.boxes.begin(), next_state.boxes.end(), [](const Point& a, const Point& b) {
-                            return a.r < b.r || (a.r == b.r && a.c < b.c);
-                        });
-                        next_state.move += path_to_push + move_chars[j];
-                        next_state.cost = current_state.cost + path_to_push.length() + 1;
-                        
-                        if (closed_set.find(next_state) == closed_set.end()) {
-                            next_states.push_back(next_state);
-                        }
+                    Point box_pos = {push_pos.r + dr[j], push_pos.c + dc[j]};
+                    Point next_box_pos = {box_pos.r + dr[j], box_pos.c + dc[j]};
+                    
+                    auto box_it = find(current_state.boxes.begin(), current_state.boxes.end(), box_pos);
+                    if (box_it == current_state.boxes.end()) continue;
+                    
+                    if (is_wall(next_box_pos.r, next_box_pos.c) ||
+                        find(current_state.boxes.begin(), current_state.boxes.end(), next_box_pos) != current_state.boxes.end() ||
+                        is_fragile(next_box_pos, current_state.fragiles) ||
+                        is_deadlock(next_box_pos)) {
+                        continue;
+                    }
+                    
+                    // Create temporary next state to check for deadlocks
+                    vector<Point> temp_boxes = current_state.boxes;
+                    temp_boxes[distance(current_state.boxes.begin(), box_it)] = next_box_pos;
+                    
+                    // Check for row/column deadlock
+                    if (row_col_deadlock(temp_boxes)) {
+                        continue;
+                    }
+                    
+                    string path_to_push = find_path(current_state.player, push_pos, current_state.boxes, current_state.fragiles);
+                    
+                    State next_state = current_state;
+                    next_state.player = box_pos;
+                    next_state.boxes[distance(current_state.boxes.begin(), box_it)] = next_box_pos;
+                    sort(next_state.boxes.begin(), next_state.boxes.end(), [](const Point& a, const Point& b) {
+                        return a.r < b.r || (a.r == b.r && a.c < b.c);
+                    });
+                    next_state.move += path_to_push + move_chars[j];
+                    next_state.cost = current_state.cost + path_to_push.length() + 1;
+                    
+                    if (closed_set.find(next_state) == closed_set.end()) {
+                        next_states.push_back(next_state);
                     }
                 }
             });
