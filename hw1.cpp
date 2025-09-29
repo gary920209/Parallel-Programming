@@ -1,20 +1,13 @@
-#include <tbb/concurrent_queue.h>
-#include <tbb/concurrent_unordered_set.h>
-#include <tbb/concurrent_vector.h>
-#include <tbb/parallel_for.h>
-#include <tbb/blocked_range.h>
 #include <iostream>
 #include <vector>
 #include <string>
 #include <queue>
+#include <unordered_map>
 #include <unordered_set>
 #include <fstream>
 #include <algorithm>
 #include <climits>
-#include <omp.h> 
 #include <boost/functional/hash.hpp>
-#include <mutex>
-#include <atomic>
 #include <bitset>
 
 using namespace std;
@@ -39,8 +32,9 @@ struct State{
     int player_idx;  // Player position as index
     GridBitset boxes;
     GridBitset fragiles;
-    string move;
+    string transition;
     int cost;
+    int parent;
 
     bool operator==(const State& other) const {
         return player_idx == other.player_idx && boxes == other.boxes && fragiles == other.fragiles;
@@ -65,8 +59,8 @@ namespace std {
     };
 }
 
-GridBitset wall_bitset;  // For walls
-GridBitset target_bitset; // For targets
+GridBitset wall_bitset; 
+GridBitset target_bitset;
 int rows, cols;
 
 // Priority queue item storing index and priority
@@ -218,7 +212,56 @@ bool is_fragile(int idx, const GridBitset& fragiles) {
     return fragiles[idx];
 }
 
-// New function to compute player reachable positions and predecessors
+bool is_blocked(int nr, int nc, const GridBitset& boxes, const GridBitset& fragiles, vector<bool>& checked, int orig_axis, const int dr[], const int dc[]) {
+    if (is_wall(nr, nc)) return true;
+    int idx = to_index(nr, nc, cols);
+    if (is_fragile(idx, fragiles)) return true;
+    if (!boxes[idx]) return false;
+    if (checked[idx]) return true; // treat as wall
+    checked[idx] = true;
+    // check if this neighbor box is frozen on the current axis
+    int r = get_row(idx, cols);
+    int c = get_col(idx, cols);
+    bool blocked1 = is_blocked(r + dr[0], c + dc[0], boxes, fragiles, checked, 1 - orig_axis, dr, dc);
+    bool blocked2 = is_blocked(r + dr[1], c + dc[1], boxes, fragiles, checked, 1 - orig_axis, dr, dc);
+    return blocked1 && blocked2;
+}
+
+bool is_axis_frozen(int box_idx, int axis, const GridBitset& boxes, const GridBitset& fragiles, vector<bool>& checked) {
+    int r = get_row(box_idx, cols);
+    int c = get_col(box_idx, cols);
+    int dr[2], dc[2];
+    if (axis == 0) { // horizontal
+        dr[0] = 0; dc[0] = -1;
+        dr[1] = 0; dc[1] = 1;
+    } else { // vertical
+        dr[0] = -1; dc[0] = 0;
+        dr[1] = 1; dc[1] = 0;
+    }
+    bool blocked1 = is_blocked(r + dr[0], c + dc[0], boxes, fragiles, checked, axis, dr, dc);
+    bool blocked2 = is_blocked(r + dr[1], c + dc[1], boxes, fragiles, checked, axis, dr, dc);
+    return blocked1 && blocked2;
+}
+
+bool has_freeze_deadlock(const GridBitset& boxes, const GridBitset& fragiles) {
+    for (int idx = 0; idx < rows * cols; ++idx) {
+        if (!boxes[idx] || target_bitset[idx]) continue;
+        vector<bool> checked(rows * cols, false);
+        bool frozen_h = is_axis_frozen(idx, 0, boxes, fragiles, checked);
+        vector<bool> checked_v(rows * cols, false);
+        bool frozen_v = is_axis_frozen(idx, 1, boxes, fragiles, checked_v);
+        if (frozen_h && frozen_v) return true;
+    }
+    return false;
+}
+
+bool is_invalid_state(const GridBitset& boxes, const GridBitset& fragiles) {
+    if (row_col_deadlock(boxes)) return true;
+    if (has_freeze_deadlock(boxes, fragiles)) return true;
+    return false;
+}
+
+// compute player reachable positions and predecessors
 void compute_player_reach(int start_idx, const GridBitset& boxes, const GridBitset& fragiles, GridBitset& reachable, vector<int>& prev) {
     reachable.reset();
     prev.assign(rows * cols, -1);
@@ -251,7 +294,7 @@ void compute_player_reach(int start_idx, const GridBitset& boxes, const GridBits
     }
 }
 
-// New function to reconstruct path using predecessors
+// reconstruct path using predecessors
 string get_path_to(int target_idx, int start_idx, const vector<int>& prev) {
     if (target_idx == start_idx) return "";
 
@@ -271,14 +314,32 @@ string get_path_to(int target_idx, int start_idx, const vector<int>& prev) {
     return path;
 }
 
+string reconstruct_path(const vector<State>& states, int goal_index) {
+    vector<string> parts;
+    int idx = goal_index;
+    while (idx != 0) {  // 0 is start
+        const State& s = states[idx];
+        parts.push_back(s.transition);
+        idx = s.parent;
+    }
+    reverse(parts.begin(), parts.end());
+    string full_move;
+    for (const auto& p : parts) {
+        full_move += p;
+    }
+    return full_move;
+}
+
 string AStar(const State& initial_state){
     // Use vector to store states and priority queue for indices
     vector<State> states;
     priority_queue<PQItem, vector<PQItem>, greater<PQItem>> pq;
-    tbb::concurrent_unordered_set<State> closed_set;
+    unordered_map<GridBitset, GridBitset> visited;
 
     State start_state = initial_state;
     start_state.cost = 0;
+    start_state.parent = -1;
+    start_state.transition = "";
     states.push_back(start_state);
     pq.push({0, StateComparator::heuristic(start_state)});  // Greedy best-first search
 
@@ -288,32 +349,28 @@ string AStar(const State& initial_state){
 
         State& current_state = states[current_item.state_index];
 
-        if (closed_set.count(current_state)) {
-            continue;
-        }
-        closed_set.insert(current_state);
-        
-        // Check if all boxes are on targets using bitwise AND
-        if ((current_state.boxes & target_bitset) == current_state.boxes) {
-            return current_state.move;  // Solution found and returned here
-        }
-
         // Compute player reachable and prev once per state
         GridBitset reachable;
         vector<int> prev(rows * cols, -1);
         compute_player_reach(current_state.player_idx, current_state.boxes, current_state.fragiles, reachable, prev);
+
+        if (visited[current_state.boxes][current_state.player_idx]) {
+            continue;
+        }
+        visited[current_state.boxes] |= reachable;
+        
+        // Check if all boxes are on targets using bitwise AND
+        if ((current_state.boxes & target_bitset) == current_state.boxes) {
+            return reconstruct_path(states, current_item.state_index);  // Solution found and returned here
+        }
         
         int dr[] = {-1, 0, 1, 0};
         int dc[] = {0, -1, 0, 1};
         char move_chars[] = {'W', 'A', 'S', 'D'};
         
-        // Create work items (position + direction pairs) for better load balancing
-        struct WorkItem {
-            int push_idx;
-            int direction;
-        };
-
-        std::vector<WorkItem> work_items;
+        // Use vector to store generated next states
+        vector<State> next_states;
+        
         for (int push_idx = 0; push_idx < rows * cols; ++push_idx) {
             if (!reachable[push_idx]) continue;
 
@@ -322,74 +379,52 @@ string AStar(const State& initial_state){
 
             for (int j = 0; j < 4; ++j) {
                 int box_idx = to_index(r + dr[j], c + dc[j], cols);
-                // Only add work item if there's actually a box at this position
-                if (current_state.boxes[box_idx]) {
-                    work_items.push_back({push_idx, j});
+                if (!current_state.boxes[box_idx]) continue;
+
+                int next_box_idx = to_index(r + 2*dr[j], c + 2*dc[j], cols);
+
+                int next_r = get_row(next_box_idx, cols);
+                int next_c = get_col(next_box_idx, cols);
+                if (is_wall(next_r, next_c) ||
+                    current_state.boxes[next_box_idx] ||
+                    current_state.fragiles[next_box_idx] ||
+                    is_deadlock(next_box_idx)) {
+                    continue;
                 }
+
+                // Create temporary bitset to check for deadlocks
+                GridBitset temp_boxes = current_state.boxes;
+                temp_boxes[box_idx] = 0;
+                temp_boxes[next_box_idx] = 1;
+
+                if (is_invalid_state(temp_boxes, current_state.fragiles)) {
+                    continue;
+                }
+
+                string path_to_push = get_path_to(push_idx, current_state.player_idx, prev);
+                if (path_to_push.empty() && push_idx != current_state.player_idx) continue;
+
+                State next_state = current_state;
+                next_state.player_idx = box_idx;
+                next_state.boxes = temp_boxes;
+                next_state.transition = path_to_push + move_chars[j];
+                next_state.cost = current_state.cost + path_to_push.length() + 1;
+                next_state.parent = current_item.state_index;
+                
+                next_states.push_back(next_state);
             }
         }
         
-        // Use concurrent_vector to store generated next states
-        tbb::concurrent_vector<State> next_states;
-        
-        // Use smaller grain size for better work distribution across threads
-        // Calculate grain size to aim for roughly 6x more chunks than threads
-        size_t grain_size = max(size_t(1), work_items.size() / 24); // 24 = 6 threads * 4 chunks per thread
-        
-        tbb::parallel_for(tbb::blocked_range<size_t>(0, work_items.size(), grain_size),
-            [&](const tbb::blocked_range<size_t>& range) {
-                for (size_t i = range.begin(); i != range.end(); ++i) {
-                    const WorkItem& work = work_items[i];
-                    int push_idx = work.push_idx;
-                    int j = work.direction;
-
-                    int push_r = get_row(push_idx, cols);
-                    int push_c = get_col(push_idx, cols);
-                    int box_idx = to_index(push_r + dr[j], push_c + dc[j], cols);
-                    int next_box_idx = to_index(push_r + 2*dr[j], push_c + 2*dc[j], cols);
-
-                    if (!current_state.boxes[box_idx]) continue;
-
-                    int next_r = get_row(next_box_idx, cols);
-                    int next_c = get_col(next_box_idx, cols);
-                    if (is_wall(next_r, next_c) ||
-                        current_state.boxes[next_box_idx] ||
-                        current_state.fragiles[next_box_idx] ||
-                        is_deadlock(next_box_idx)) {
-                        continue;
-                    }
-
-                    // Create temporary bitset to check for deadlocks
-                    GridBitset temp_boxes = current_state.boxes;
-                    temp_boxes[box_idx] = 0;
-                    temp_boxes[next_box_idx] = 1;
-
-                    if (row_col_deadlock(temp_boxes)) {
-                        continue;
-                    }
-
-                    string path_to_push = get_path_to(push_idx, current_state.player_idx, prev);
-                    if (path_to_push.empty() && push_idx != current_state.player_idx) continue;
-
-                    State next_state = current_state;
-                    next_state.player_idx = box_idx;
-                    next_state.boxes[box_idx] = 0;
-                    next_state.boxes[next_box_idx] = 1;
-                    next_state.move += path_to_push + move_chars[j];
-                    next_state.cost = current_state.cost + path_to_push.length() + 1;
-                    
-                    if (closed_set.find(next_state) == closed_set.end()) {
-                        next_states.push_back(next_state);
-                    }
-                }
-            });
-        
-        // After parallel region, add states to vector and push indices to priority_queue
-        for (const auto& state : next_states) {
-            states.push_back(state);
-            int state_index = states.size() - 1;
-            int priority = StateComparator::heuristic(state);  // Greedy best-first search
-            pq.push({state_index, priority});
+        // After loop, add states to vector and push indices to priority_queue if not visited
+        for (auto& state : next_states) {
+            auto it = visited.find(state.boxes);
+            bool is_visited = (it != visited.end() && it->second[state.player_idx]);
+            if (!is_visited) {
+                states.push_back(state);
+                int state_index = states.size() - 1;
+                int priority = StateComparator::heuristic(state);  // Greedy best-first search
+                pq.push({state_index, priority});
+            }
         }
     }
 
@@ -406,10 +441,10 @@ int StateComparator::heuristic(const State& state) {
 
     int k = box_list.size();
     int m = target_list.size();
-    if (k > m) return INT_MAX;  // Impossible
+    if (k > m) return INT_MAX;  
 
     // Compute exact min matching if m small, else greedy
-    if (m <= 20) {  // Adjust based on performance
+    if (m <= 20) {  
         vector<vector<int>> cost(k, vector<int>(m, 0));
         for (int i = 0; i < k; ++i) {
             int br = get_row(box_list[i], cols);
@@ -491,7 +526,6 @@ int main(int argc, char* argv[]) {
 
     string line;
     State initial_state;
-    initial_state.move = "";
     initial_state.boxes.reset();
     initial_state.fragiles.reset();
 
