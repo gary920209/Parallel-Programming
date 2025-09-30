@@ -17,24 +17,20 @@
 
 using namespace std;
 
-const int MAX_SIZE = 256; // 16*16 max grid size
-using GridBitset = bitset<MAX_SIZE + 9>;
+const int MAX_SIZE = 256; // spec say maxium grid size = 16*16
+using GridBitset = bitset<MAX_SIZE + 9>; // +9 for padding to avoid boundary checks
 
-// Helper functions for index operations
 inline int get_row(int index, int cols) {
     return index / cols;
 }
-
 inline int get_col(int index, int cols) {
     return index % cols;
 }
-
 inline int to_index(int r, int c, int cols) {
     return r * cols + c;
 }
-
 struct State {
-    int player_idx;  // Player position as index
+    int player_idx;  
     GridBitset boxes;
     string transition;
     int cost;
@@ -64,7 +60,7 @@ vector<vector<int>> dist_to_target;  // dist_to_target[pos][target_index in targ
 // Priority queue item storing index and priority
 struct PQItem {
     int state_index;
-    int priority;  // f = g + w * h
+    int priority;  // f = g + w * h, by A Star
 
     bool operator>(const PQItem& other) const {
         return priority > other.priority;
@@ -74,12 +70,11 @@ struct PQItem {
 struct StateComparator {
     static int heuristic(const GridBitset& boxes);
 };
-
+// rol and col deadlock detection for test case 5
 bool is_wall(int r, int c) {
     if (r < 0 || r >= rows || c < 0 || c >= cols) return true;
     return wall_bitset[r * cols + c];
 }
-
 bool is_wall_row(int r) {
     if (r < 0 || r >= rows) return true;
     for (int c = 0; c < cols; c++) {
@@ -87,7 +82,6 @@ bool is_wall_row(int r) {
     }
     return true;
 }
-
 bool is_wall_col(int c) {
     if (c < 0 || c >= cols) return true;
     for (int r = 0; r < rows; r++) {
@@ -95,7 +89,6 @@ bool is_wall_col(int c) {
     }
     return true;
 }
-
 bool row_col_deadlock(const GridBitset& boxes) {
     for (int idx = 0; idx < rows * cols; ++idx) {
         if (!boxes[idx]) continue;
@@ -153,7 +146,7 @@ bool row_col_deadlock(const GridBitset& boxes) {
     }
     return false;
 }
-
+// Mark unreachable cells as fragile, so that boxes cannot be pushed there
 void mark_unreachable_as_fragile() {
     GridBitset reachable;
     queue<int> q;
@@ -193,7 +186,7 @@ void mark_unreachable_as_fragile() {
         }
     }
 }
-
+// Precompute distances from each cell to each target using BFS
 void precompute_distances() {
     int n = rows * cols;
     dist_to_target.assign(n, vector<int>(target_list.size(), INT_MAX / 2));
@@ -247,7 +240,7 @@ bool is_deadlock(int box_idx) {
 bool is_fragile(int idx) {
     return fragile_bitset[idx];
 }
-
+// Check if a box is frozen along an axis (horizontal or vertical)
 bool is_blocked(int nr, int nc, const GridBitset& boxes, vector<bool>& checked, int orig_axis, const int dr[], const int dc[]) {
     if (is_wall(nr, nc)) return true;
     int idx = to_index(nr, nc, cols);
@@ -261,7 +254,6 @@ bool is_blocked(int nr, int nc, const GridBitset& boxes, vector<bool>& checked, 
     bool blocked2 = is_blocked(r + dr[1], c + dc[1], boxes, checked, 1 - orig_axis, dr, dc);
     return blocked1 && blocked2;
 }
-
 bool is_axis_frozen(int box_idx, int axis, const GridBitset& boxes, vector<bool>& checked) {
     int r = get_row(box_idx, cols);
     int c = get_col(box_idx, cols);
@@ -277,7 +269,6 @@ bool is_axis_frozen(int box_idx, int axis, const GridBitset& boxes, vector<bool>
     bool blocked2 = is_blocked(r + dr[1], c + dc[1], boxes, checked, axis, dr, dc);
     return blocked1 && blocked2;
 }
-
 bool has_freeze_deadlock(const GridBitset& boxes) {
     for (int idx = 0; idx < rows * cols; ++idx) {
         if (!boxes[idx] || target_bitset[idx]) continue;
@@ -292,10 +283,10 @@ bool has_freeze_deadlock(const GridBitset& boxes) {
 
 bool is_invalid_state(const GridBitset& boxes) {
     if (row_col_deadlock(boxes)) return true;
-    if (has_freeze_deadlock(boxes)) return true;
+    // if (has_freeze_deadlock(boxes)) return true;  // Comment to speed up
     return false;
 }
-
+// Compute all reachable positions for the player using BFS
 void compute_player_reach(int start_idx, const GridBitset& boxes, GridBitset& reachable, vector<int>& prev) {
     reachable.reset();
     prev.assign(rows * cols, -1);
@@ -375,7 +366,7 @@ string AStar(const State& initial_state) {
     start_state.parent = -1;
     start_state.transition = "";
     states.push_back(start_state);
-    pq.push({0, start_state.cost + 4 * StateComparator::heuristic(start_state.boxes)});  // w=4
+    pq.push({0, start_state.cost + 5 * StateComparator::heuristic(start_state.boxes)});  // w=5
 
     while (!pq.empty()) {
         PQItem current_item = pq.top();
@@ -394,7 +385,7 @@ string AStar(const State& initial_state) {
         states_explored++;
 
         if ((current_state.boxes & target_bitset) == current_state.boxes) {
-            cerr << "States explored: " << states_explored << endl;
+            // cerr << "States explored: " << states_explored << endl;
             return reconstruct_path(states, current_item.state_index);
         }
 
@@ -476,13 +467,13 @@ string AStar(const State& initial_state) {
                 states.push_back(state);
                 int state_index = states.size() - 1;
                 int h = StateComparator::heuristic(state.boxes);
-                int priority = state.cost + 4 * h;  // w=4
+                int priority = state.cost + 5 * h;  // w=5
                 pq.push({state_index, priority});
             }
         }
     }
 
-    cerr << "States explored: " << states_explored << endl;
+    // cerr << "States explored: " << states_explored << endl;
     return "";
 }
 
@@ -498,7 +489,6 @@ int StateComparator::heuristic(const GridBitset& boxes) {
 
     int total_distance = 0;
     vector<bool> used(m, false);
-    vector<int> assign(k);
 
     for (int i = 0; i < k; ++i) {
         int box = box_list[i];
@@ -515,68 +505,13 @@ int StateComparator::heuristic(const GridBitset& boxes) {
         if (best_j != -1) {
             used[best_j] = true;
             total_distance += min_dist;
-            assign[i] = best_j;
         }
     }
 
-    // Calculate linear conflicts
-    int linear_conflicts = 0;
-
-    // For rows
-    unordered_map<int, vector<pair<int, int>>> row_map;  // row -> {box_col, target_col}
-    for (int i = 0; i < k; ++i) {
-        int br = get_row(box_list[i], cols);
-        int bc = get_col(box_list[i], cols);
-        int tj = assign[i];
-        int tr = get_row(target_list[tj], cols);
-        int tc = get_col(target_list[tj], cols);
-        if (br == tr) {
-            row_map[br].emplace_back(bc, tc);
-        }
-    }
-
-    for (auto& entry : row_map) {
-        auto& pairs = entry.second;
-        sort(pairs.begin(), pairs.end());  // sort by box_col
-        for (size_t p = 0; p < pairs.size(); ++p) {
-            for (size_t q = p + 1; q < pairs.size(); ++q) {
-                if (pairs[p].second > pairs[q].second) {  // inversion in target_col
-                    linear_conflicts++;
-                }
-            }
-        }
-    }
-
-    // For columns
-    unordered_map<int, vector<pair<int, int>>> col_map;  // col -> {box_row, target_row}
-    for (int i = 0; i < k; ++i) {
-        int br = get_row(box_list[i], cols);
-        int bc = get_col(box_list[i], cols);
-        int tj = assign[i];
-        int tr = get_row(target_list[tj], cols);
-        int tc = get_col(target_list[tj], cols);
-        if (bc == tc) {
-            col_map[bc].emplace_back(br, tr);
-        }
-    }
-
-    for (auto& entry : col_map) {
-        auto& pairs = entry.second;
-        sort(pairs.begin(), pairs.end());  // sort by box_row
-        for (size_t p = 0; p < pairs.size(); ++p) {
-            for (size_t q = p + 1; q < pairs.size(); ++q) {
-                if (pairs[p].second > pairs[q].second) {  // inversion in target_row
-                    linear_conflicts++;
-                }
-            }
-        }
-    }
-
-    return total_distance + 2 * linear_conflicts;
+    return total_distance;
 }
 
 int main(int argc, char* argv[]) {
-
     auto start_time = chrono::high_resolution_clock::now();
 
     if (argc < 2) {
@@ -650,7 +585,7 @@ int main(int argc, char* argv[]) {
     auto end_time = chrono::high_resolution_clock::now();
     auto duration = chrono::duration_cast<chrono::milliseconds>(end_time - start_time);
 
-    cerr << "Total time: " << duration.count() << " ms" << endl;
+    // cerr << "Total time: " << duration.count() << " ms" << endl;
     cout << solution << endl;
     return 0;
 }
